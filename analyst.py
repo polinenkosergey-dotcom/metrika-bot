@@ -1,7 +1,7 @@
 """
 AI-агент аналитики.
-Содержит инструменты (tools) и агентный цикл на базе Claude API.
-Не зависит от Telegram — принимает запрос строкой, возвращает текст.
+Инструменты поддерживают filter_host для layered-счётчиков
+(ВУЗ = субдомен, продукт = путь).
 """
 
 import json
@@ -18,16 +18,24 @@ TOOLS = [
     {
         "name": "get_summary_metrics",
         "description": (
-            "Получить сводные метрики продукта за текущую и прошлую неделю: "
-            "визиты, уники, bounce rate, глубина просмотра, время на сайте, WoW-дельта."
+            "Получить сводные метрики за текущую и прошлую неделю: "
+            "визиты, уники, bounce rate, глубина, время на сайте, WoW-дельта."
         ),
         "input_schema": {
             "type": "object",
             "properties": {
-                "product_name": {"type": "string", "description": "Название продукта"},
+                "product_name": {"type": "string"},
                 "url_prefix": {
                     "type": "string",
-                    "description": "URL-префикс продукта, например /hr или /finance. Пустая строка — весь счётчик.",
+                    "description": "Путь продукта, например /tasks. Пустая строка — весь счётчик/ВУЗ.",
+                },
+                "filter_host": {
+                    "type": "string",
+                    "description": (
+                        "Хост для фильтрации (только для layered-счётчиков). "
+                        "Например: mai.saas.sferaplatform.ru. "
+                        "Пустая строка если фильтр по хосту не нужен."
+                    ),
                 },
             },
             "required": ["product_name", "url_prefix"],
@@ -35,61 +43,60 @@ TOOLS = [
     },
     {
         "name": "get_traffic_sources",
-        "description": "Получить разбивку трафика по источникам (organic, direct, referral, social, ad и др.).",
+        "description": "Разбивка трафика по источникам (organic, direct, referral и др.).",
         "input_schema": {
             "type": "object",
             "properties": {
                 "product_name": {"type": "string"},
                 "url_prefix": {"type": "string"},
+                "filter_host": {"type": "string"},
             },
             "required": ["product_name", "url_prefix"],
         },
     },
     {
         "name": "get_top_pages",
-        "description": "Получить топ страниц по визитам с bounce rate для каждой страницы.",
+        "description": "Топ страниц по визитам с bounce rate.",
         "input_schema": {
             "type": "object",
             "properties": {
                 "product_name": {"type": "string"},
                 "url_prefix": {"type": "string"},
-                "limit": {
-                    "type": "integer",
-                    "description": "Количество страниц, по умолчанию 10",
-                    "default": 10,
-                },
+                "filter_host": {"type": "string"},
+                "limit": {"type": "integer", "default": 10},
             },
             "required": ["product_name", "url_prefix"],
         },
     },
     {
         "name": "get_devices",
-        "description": "Получить разбивку трафика по типам устройств.",
+        "description": "Разбивка по типам устройств.",
         "input_schema": {
             "type": "object",
             "properties": {
                 "product_name": {"type": "string"},
                 "url_prefix": {"type": "string"},
+                "filter_host": {"type": "string"},
             },
             "required": ["product_name", "url_prefix"],
         },
     },
 ]
 
-SYSTEM_PROMPT = """Ты — AI-аналитик продуктовой платформы «Сфера». 
-Твой токен Яндекс Метрики даёт доступ к одному счётчику, в котором все продукты разделены по URL-префиксам.
+SYSTEM_PROMPT = """Ты — AI-аналитик продуктовой платформы «Сфера».
 
-При анализе ищи и явно называй:
+Важно: при анализе продуктов с layered-счётчиком (ВУЗы) всегда передавай
+filter_host (хост ВУЗа) вместе с url_prefix (путь продукта).
+Это обеспечивает точную фильтрацию по конкретному ВУЗу.
+
+При анализе ищи:
 • Падение трафика >20% за неделю → критично
-• Bounce rate >70% → проблема с UX или релевантностью
-• Рост трафика >30% → нужно убедиться что инфраструктура справляется  
-• Доминирование одного источника >80% → риск зависимости
-• Страницы с аномально высоким bounce rate в топе
+• Bounce rate >70% → проблема с UX
+• Рост >30% → проверить инфраструктуру
+• Один источник трафика >80% → риск зависимости
 
-Давай конкретные рекомендации: не «улучшить UX», а «на /hr/onboarding bounce 82% — проверить форму регистрации».
-
-Пиши кратко и по делу. Используй эмодзи для наглядности.
-Отвечай на русском языке."""
+Давай конкретные рекомендации с цифрами и URL.
+Пиши кратко. Эмодзи для структуры. Отвечай на русском."""
 
 
 class AnalystAgent:
@@ -97,31 +104,29 @@ class AnalystAgent:
         self.claude = anthropic.Anthropic(api_key=anthropic_key)
         self.metrika = metrika_client
 
+    def set_counter(self, counter_id: int):
+        self.metrika = self.metrika.with_counter(counter_id)
+
     def _run_tool(self, name: str, args: dict) -> Any:
         prefix = args.get("url_prefix") or None
-        log.info("🔧 %s | prefix=%s", name, prefix)
+        host = args.get("filter_host") or None
+        log.info("🔧 %s | prefix=%s | host=%s", name, prefix, host)
 
         if name == "get_summary_metrics":
-            return self.metrika.get_summary(prefix)
+            return self.metrika.get_summary(prefix, host)
         elif name == "get_traffic_sources":
-            return self.metrika.get_traffic_sources(prefix)
+            return self.metrika.get_traffic_sources(prefix, host)
         elif name == "get_top_pages":
-            return self.metrika.get_top_pages(prefix, args.get("limit", 10))
+            return self.metrika.get_top_pages(prefix, host, args.get("limit", 10))
         elif name == "get_devices":
-            return self.metrika.get_devices(prefix)
-        else:
-            return {"error": f"unknown tool: {name}"}
+            return self.metrika.get_devices(prefix, host)
+        return {"error": f"unknown tool: {name}"}
 
     def run(self, user_message: str, status_callback=None) -> str:
-        """
-        Запускает агентный цикл.
-        status_callback(text) — вызывается при промежуточных статусах
-        (можно использовать для отправки «печатает...» в Telegram).
-        """
         messages = [{"role": "user", "content": user_message}]
         final_text_parts = []
 
-        for iteration in range(50):  # защита от бесконечного цикла
+        for _ in range(50):
             response = self.claude.messages.create(
                 model="claude-sonnet-4-20250514",
                 max_tokens=4096,
@@ -129,16 +134,11 @@ class AnalystAgent:
                 tools=TOOLS,
                 messages=messages,
             )
-
             messages.append({"role": "assistant", "content": response.content})
 
-            # Собираем текстовые блоки
             for block in response.content:
                 if block.type == "text" and block.text.strip():
                     final_text_parts.append(block.text.strip())
-                    if status_callback and iteration > 0:
-                        # Промежуточный текст — информируем пользователя
-                        status_callback(f"💭 {block.text[:200]}")
 
             if response.stop_reason == "end_turn":
                 break
@@ -157,8 +157,8 @@ class AnalystAgent:
                         tool_names.append(block.name)
 
                 if status_callback:
-                    status_callback(f"🔍 Запрашиваю: {', '.join(tool_names)}...")
+                    status_callback(f"🔍 {', '.join(tool_names)}...")
 
                 messages.append({"role": "user", "content": tool_results})
 
-        return "\n\n".join(final_text_parts) or "Анализ завершён без результатов."
+        return "\n\n".join(final_text_parts) or "Анализ завершён."
