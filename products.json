@@ -1,0 +1,22 @@
+[
+  {
+    "name": "Документооборот",
+    "url_prefix": "/dms",
+    "owner": "@ivanov"
+  },
+  {
+    "name": "Кадровый портал",
+    "url_prefix": "/hr",
+    "owner": "@petrova"
+  },
+  {
+    "name": "Финансовый модуль",
+    "url_prefix": "/finance",
+    "owner": "@sidorov"
+  },
+  {
+    "name": "Портал закупок",
+    "url_prefix": "/procurement",
+    "owner": "@kozlov"
+  }
+]
