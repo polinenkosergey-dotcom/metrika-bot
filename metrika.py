@@ -330,10 +330,12 @@ class MetrikaClient:
         hosts = filter_hosts or ([filter_host] if filter_host else [])
 
         if hosts and url_prefix:
-            parts = [f"ym:s:startURL=@'https://{h}{url_prefix}'" for h in hosts]
+            # Фильтруем по хосту И пути — без https:// чтобы ловить все страницы домена
+            parts = [f"ym:s:startURL=@'{h}{url_prefix}'" for h in hosts]
             return " OR ".join(parts)
         if hosts:
-            parts = [f"ym:s:startURL=@'https://{h}/'" for h in hosts]
+            # Только по хосту — все страницы домена
+            parts = [f"ym:s:startURL=@'{h}'" for h in hosts]
             return " OR ".join(parts)
         if url_prefix:
             return f"ym:s:startURL=@'{url_prefix}'"
@@ -542,6 +544,70 @@ class MetrikaClient:
             return round(data.get("totals", [0])[0])
         except Exception as e:
             log.warning("get_cumulative_users: %s", e)
+            return 0
+
+    def get_active_users(
+        self,
+        d1: str,
+        d2: str,
+        filter_hosts: list[str] | None = None,
+        filter_host: str | None = None,
+        min_visits: int = 3,
+    ) -> int:
+        """
+        Активные пользователи = те кто совершил min_visits+ визитов за период.
+        Использует фильтр ym:s:visitNumber>={min_visits}.
+        """
+        assert self.counter_id
+        host_filter = self._make_filter(None, filter_host, filter_hosts)
+        visit_filter = f"ym:s:visitNumber>={min_visits}"
+
+        if host_filter:
+            combined = f"({host_filter}) AND {visit_filter}"
+        else:
+            combined = visit_filter
+
+        params = {
+            "ids": self.counter_id,
+            "metrics": "ym:s:users",
+            "date1": d1,
+            "date2": d2,
+            "accuracy": "full",
+            "filters": combined,
+        }
+        try:
+            data = self._get("/stat/v1/data", params)
+            return round(data.get("totals", [0])[0])
+        except Exception as e:
+            log.warning("get_active_users: %s", e)
+            return 0
+
+    def get_new_users(
+        self,
+        d1: str,
+        d2: str,
+        filter_hosts: list[str] | None = None,
+        filter_host: str | None = None,
+    ) -> int:
+        """
+        Новые пользователи = те кто пришёл впервые (ym:s:newUsers).
+        """
+        assert self.counter_id
+        flt = self._make_filter(None, filter_host, filter_hosts)
+        params = {
+            "ids": self.counter_id,
+            "metrics": "ym:s:newUsers",
+            "date1": d1,
+            "date2": d2,
+            "accuracy": "full",
+        }
+        if flt:
+            params["filters"] = flt
+        try:
+            data = self._get("/stat/v1/data", params)
+            return round(data.get("totals", [0])[0])
+        except Exception as e:
+            log.warning("get_new_users: %s", e)
             return 0
 
     def get_users_by_product_monthly(

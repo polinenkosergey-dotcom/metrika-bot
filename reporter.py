@@ -1,16 +1,14 @@
 """
 reporter.py — отчёт по ВУЗам.
 
-Логика периодов:
-  - "Последний полный месяц" = прошлый завершённый месяц (если сейчас апрель → март)
-  - "Предыдущий месяц"       = позапрошлый (февраль)
-  - Прирост = сравнение двух завершённых месяцев, не текущего незавершённого
+Определения:
+  Новые пользователи   = ym:s:newUsers (первый визит за всю историю счётчика)
+  Активные             = пользователи с 3+ визитами за месяц (visitNumber >= 3)
+  Все посетители       = ym:s:users (уникальные за период, хотя бы 1 визит)
+  Накопленно           = ym:s:users с 2024-01-01 по сегодня
 
-Формат:
-  Таблица Markdown с колонками:
-  №, ВУЗ, Новые польз. за период, Активные за период, Рекомендации
-
-  Все ВУЗы из UNI_REGISTRY показываются даже без данных.
+Период: два последних ЗАВЕРШЁННЫХ месяца (не текущий).
+Прирост: сравнение последнего полного месяца с предыдущим по метрике "Все посетители".
 """
 
 import io
@@ -28,7 +26,7 @@ import matplotlib.ticker as mticker
 import numpy as np
 import requests as req_lib
 
-from metrika import MetrikaClient, UNI_REGISTRY, _prettify_prefix
+from metrika import MetrikaClient, UNI_REGISTRY, UNI_SLUG_MERGE, _prettify_prefix
 
 log = logging.getLogger("reporter")
 
@@ -43,21 +41,18 @@ MONTH_RU = {
     "09": "сен", "10": "окт", "11": "ноя", "12": "дек",
 }
 
+# Активный = 3+ визитов за период
+ACTIVE_MIN_VISITS = 3
+
 
 def month_label(ym: str) -> str:
-    """'2026-03' → 'мар 2026'"""
     y, m = ym.split("-")
     return f"{MONTH_RU.get(m, m)} {y}"
 
 
 def last_full_months(n: int = 2) -> list[tuple[str, str, str]]:
-    """
-    Возвращает последние N завершённых месяцев.
-    Если сейчас апрель 2026 → [(2026-02, ...), (2026-03, ...)]
-    Формат каждого: (ym_label, date_from, date_to)
-    """
+    """Последние N завершённых месяцев: [(ym, date_from, date_to), ...]"""
     today = date.today()
-    # Прошлый месяц (последний полный)
     result = []
     for offset in range(n, 0, -1):
         month = today.month - offset
@@ -66,132 +61,164 @@ def last_full_months(n: int = 2) -> list[tuple[str, str, str]]:
             month += 12
             year  -= 1
         last_day = monthrange(year, month)[1]
-        ym    = f"{year:04d}-{month:02d}"
-        d1    = f"{year:04d}-{month:02d}-01"
-        d2    = f"{year:04d}-{month:02d}-{last_day:02d}"
-        result.append((ym, d1, d2))
+        ym = f"{year:04d}-{month:02d}"
+        result.append((ym, f"{year:04d}-{month:02d}-01", f"{year:04d}-{month:02d}-{last_day:02d}"))
     return result
 
 
 # ── Сбор данных ───────────────────────────────────────────────────────────────
 
 def collect_uni_stats(metrika: MetrikaClient, uni: dict) -> dict:
-    """
-    Собирает метрики для одного ВУЗа за два последних ПОЛНЫХ месяца.
-    Возвращает данные для таблицы.
-    """
     hosts = uni.get("hosts") or ([uni["host"]] if uni.get("host") else [])
     slug  = uni["slug"]
     name  = uni["name"]
 
+    if not hosts:
+        return _empty_stats(slug, name)
+
     log.info("📊 %s | hosts=%s", name, hosts)
 
-    # Два последних полных месяца
-    periods = last_full_months(2)
-    last_ym, last_d1, last_d2       = periods[-1]  # март
-    prev_ym, prev_d1, prev_d2       = periods[-2]  # февраль
+    periods  = last_full_months(2)
+    last_ym, last_d1, last_d2 = periods[-1]
+    prev_ym, prev_d1, prev_d2 = periods[-2]
 
-    def fetch_users(d1: str, d2: str) -> int:
-        flt = MetrikaClient._make_filter(None, None, hosts)
-        params = {
-            "ids": metrika.counter_id,
-            "metrics": "ym:s:users",
-            "date1": d1,
-            "date2": d2,
-            "accuracy": "full",
-        }
-        if flt:
-            params["filters"] = flt
-        try:
-            data = metrika._get("/stat/v1/data", params)
-            return round(data.get("totals", [0])[0])
-        except Exception as e:
-            log.warning("fetch_users %s-%s: %s", d1, d2, e)
-            return 0
+    # Все посетители за каждый месяц
+    last_all  = _fetch(metrika, "ym:s:users",    last_d1, last_d2, hosts)
+    prev_all  = _fetch(metrika, "ym:s:users",    prev_d1, prev_d2, hosts)
 
-    last_users = fetch_users(last_d1, last_d2)
-    prev_users = fetch_users(prev_d1, prev_d2)
+    # Новые пользователи за последний полный месяц
+    last_new  = _fetch(metrika, "ym:s:newUsers", last_d1, last_d2, hosts)
 
-    # Нарастающий итог с начала подключения
+    # Активные (3+ визитов) за последний полный месяц
+    last_active = metrika.get_active_users(last_d1, last_d2,
+                                           filter_hosts=hosts,
+                                           min_visits=ACTIVE_MIN_VISITS)
+
+    # Нарастающий итог
     cumulative = metrika.get_cumulative_users(filter_hosts=hosts, since="2024-01-01")
 
-    # Прирост (два завершённых месяца)
-    growth     = last_users - prev_users
-    growth_pct = round(growth / prev_users * 100, 1) if prev_users else None
+    # Прирост посетителей
+    growth     = last_all - prev_all
+    growth_pct = round(growth / prev_all * 100, 1) if prev_all else None
 
-    # Помесячная динамика для графиков (3 месяца)
-    monthly = metrika.get_users_by_month(months=4, filter_hosts=hosts)
-    # Берём только завершённые месяцы (убираем текущий)
+    # Помесячная динамика для графиков
+    monthly = _fetch_monthly(metrika, hosts, months=4)
     today_ym = date.today().strftime("%Y-%m")
     monthly  = [m for m in monthly if m["month"] != today_ym]
 
-    # Продукты за последний полный месяц
+    # Продукты за последний месяц
     product_monthly = metrika.get_users_by_product_monthly(filter_hosts=hosts, months=3)
-
-    # Топ продуктов за последний полный месяц
-    top_products = {}
-    if product_monthly:
-        for prefix, records in product_monthly.items():
-            v = next((r["users"] for r in records if r["month"] == last_ym), 0)
-            if v > 0:
-                top_products[_prettify_prefix(prefix, "")] = v
-        top_products = dict(sorted(top_products.items(), key=lambda x: -x[1])[:5])
+    top_products = _top_products(product_monthly, last_ym)
 
     return {
-        "slug":          slug,
-        "name":          name,
-        "hosts":         hosts,
-        "cumulative":    cumulative,
-        "last_ym":       last_ym,
-        "last_users":    last_users,    # активные за последний полный месяц
-        "prev_ym":       prev_ym,
-        "prev_users":    prev_users,    # активные за предыдущий полный месяц
-        "growth":        growth,
-        "growth_pct":    growth_pct,
-        "monthly":       monthly,
-        "top_products":  top_products,
+        "slug":           slug,
+        "name":           name,
+        "hosts":          hosts,
+        "cumulative":     cumulative,
+        "last_ym":        last_ym,
+        "last_all":       last_all,      # все посетители
+        "last_new":       last_new,      # новые (первый визит)
+        "last_active":    last_active,   # активные (3+ визитов)
+        "prev_ym":        prev_ym,
+        "prev_all":       prev_all,
+        "growth":         growth,
+        "growth_pct":     growth_pct,
+        "monthly":        monthly,
+        "top_products":   top_products,
+        "product_monthly": product_monthly,
     }
 
 
+def _empty_stats(slug: str, name: str) -> dict:
+    periods = last_full_months(2)
+    return {
+        "slug": slug, "name": name, "hosts": [],
+        "cumulative": 0,
+        "last_ym": periods[-1][0], "last_all": 0, "last_new": 0, "last_active": 0,
+        "prev_ym": periods[-2][0], "prev_all": 0,
+        "growth": 0, "growth_pct": None,
+        "monthly": [], "top_products": {}, "product_monthly": {},
+    }
+
+
+def _fetch(metrika: MetrikaClient, metric: str, d1: str, d2: str,
+           hosts: list[str]) -> int:
+    flt = MetrikaClient._make_filter(None, None, hosts)
+    params = {"ids": metrika.counter_id, "metrics": metric,
+              "date1": d1, "date2": d2, "accuracy": "full"}
+    if flt:
+        params["filters"] = flt
+    try:
+        data = metrika._get("/stat/v1/data", params)
+        return round(data.get("totals", [0])[0])
+    except Exception as e:
+        log.warning("_fetch %s: %s", metric, e)
+        return 0
+
+
+def _fetch_monthly(metrika: MetrikaClient, hosts: list[str], months: int) -> list[dict]:
+    from calendar import monthrange as mr
+    today  = date.today()
+    result = []
+    for i in range(months - 1, -1, -1):
+        month = today.month - i
+        year  = today.year
+        while month <= 0:
+            month += 12; year -= 1
+        ym  = f"{year:04d}-{month:02d}"
+        d1  = f"{year:04d}-{month:02d}-01"
+        d2  = f"{year:04d}-{month:02d}-{mr(year, month)[1]:02d}"
+        users = _fetch(metrika, "ym:s:users", d1, d2, hosts)
+        result.append({"month": ym, "users": users})
+    return result
+
+
+def _top_products(product_monthly: dict, last_ym: str) -> dict:
+    result = {}
+    for prefix, records in product_monthly.items():
+        v = next((r["users"] for r in records if r["month"] == last_ym), 0)
+        if v > 0:
+            result[_prettify_prefix(prefix, "")] = v
+    return dict(sorted(result.items(), key=lambda x: -x[1])[:5])
+
+
 def make_recommendation(s: dict) -> str:
-    """Генерирует текстовую рекомендацию на основе данных."""
     parts = []
-    gp   = s.get("growth_pct")
-    g    = s.get("growth", 0)
-    last = s.get("last_users", 0)
-    cum  = s.get("cumulative", 0)
+    last   = s.get("last_all", 0)
+    new_u  = s.get("last_new", 0)
+    active = s.get("last_active", 0)
+    cum    = s.get("cumulative", 0)
+    gp     = s.get("growth_pct")
 
     if last == 0 and cum == 0:
         return "Нет данных — ВУЗ не подключён или не активен"
-
     if last == 0:
-        return "Активности в последнем месяце нет — проверить доступность платформы для студентов"
+        return "Активности нет — проверить доступность платформы"
 
     if gp is not None:
         if gp >= 50:
-            parts.append(f"🚀 Сильный рост +{gp}% — зафиксировать что сработало и масштабировать")
+            parts.append(f"🚀 Сильный рост +{gp}%")
         elif gp >= 10:
-            parts.append(f"📈 Умеренный рост +{gp}% — положительная динамика")
+            parts.append(f"📈 Рост +{gp}%")
         elif gp >= -10:
-            parts.append("➡️ Стабильная аудитория")
+            parts.append("➡️ Стабильно")
         elif gp >= -30:
-            parts.append(f"📉 Снижение {gp}% — выяснить причину оттока")
+            parts.append(f"📉 Снижение {gp}% — выяснить причину")
         else:
-            parts.append(f"⚠️ Значительный спад {gp}% — требует внимания")
+            parts.append(f"⚠️ Спад {gp}% — требует внимания")
 
-    if cum > 0:
-        eng = round(last / cum * 100)
-        if eng < 15:
-            parts.append(f"Вовлечённость {eng}% — низкая, улучшить онбординг")
-        elif eng > 60:
-            parts.append(f"Вовлечённость {eng}% — высокая ✓")
+    if last > 0:
+        act_rate = round(active / last * 100)
+        if act_rate < 20:
+            parts.append(f"Активных {act_rate}% — низко, улучшить retention")
+        elif act_rate > 50:
+            parts.append(f"Активных {act_rate}% — высокая вовлечённость ✓")
         else:
-            parts.append(f"Вовлечённость {eng}%")
+            parts.append(f"Активных {act_rate}%")
 
     top = s.get("top_products", {})
     if top:
-        top_name = next(iter(top))
-        parts.append(f"Топ продукт: {top_name}")
+        parts.append(f"Топ: {next(iter(top))}")
 
     return "; ".join(parts) if parts else "—"
 
@@ -199,105 +226,86 @@ def make_recommendation(s: dict) -> str:
 # ── Markdown-таблица ──────────────────────────────────────────────────────────
 
 def render_markdown_table(uni_stats: list[dict]) -> str:
-    """
-    Формирует Markdown-отчёт в виде таблицы.
-    Показывает все ВУЗы из UNI_REGISTRY, даже без данных.
-    """
-    if not uni_stats:
-        return "Нет данных"
+    sample    = next((s for s in uni_stats if s.get("last_ym")), None)
+    last_ym   = sample["last_ym"] if sample else ""
+    prev_ym   = sample["prev_ym"] if sample else ""
+    last_lbl  = month_label(last_ym) if last_ym else "—"
+    prev_lbl  = month_label(prev_ym) if prev_ym else "—"
+    today_str = datetime.now().strftime("%d.%m.%Y")
 
-    # Периоды из первого ВУЗа с данными
-    sample     = next((s for s in uni_stats if s.get("last_ym")), uni_stats[0])
-    last_ym    = sample.get("last_ym", "")
-    prev_ym    = sample.get("prev_ym", "")
-    last_label = month_label(last_ym) if last_ym else "—"
-    prev_label = month_label(prev_ym) if prev_ym else "—"
-    today_str  = datetime.now().strftime("%d.%m.%Y")
-
-    # Строим словарь slug → stats
     stats_map = {s["slug"]: s for s in uni_stats}
 
-    # Полный список ВУЗов из реестра (в порядке убывания активных)
-    all_slugs = list(UNI_REGISTRY.keys())
-    # Убираем дубли (fta → fa уже в реестре)
-    seen_names: set[str] = set()
+    # Уникальные ВУЗы из реестра без дублей
+    seen: set[str] = set()
     unique_slugs: list[str] = []
-    for slug in all_slugs:
-        name = UNI_REGISTRY[slug]
-        if name not in seen_names:
-            seen_names.add(name)
-            unique_slugs.append(slug)
+    for slug, name in UNI_REGISTRY.items():
+        canonical = UNI_SLUG_MERGE.get(slug, slug)
+        if name not in seen:
+            seen.add(name)
+            unique_slugs.append(canonical if canonical in stats_map else slug)
 
-    # Сортируем: у кого есть данные — по убыванию активных, остальные в конце
-    def sort_key(slug):
-        s = stats_map.get(slug)
-        return -(s["last_users"] if s else 0)
-    unique_slugs.sort(key=sort_key)
+    unique_slugs.sort(key=lambda sl: -(stats_map[sl]["last_all"] if sl in stats_map else 0))
 
-    # Итоги
-    total_last = sum(s["last_users"] for s in uni_stats)
-    total_cum  = sum(s["cumulative"] for s in uni_stats)
+    total_all    = sum(s["last_all"]    for s in uni_stats)
+    total_new    = sum(s["last_new"]    for s in uni_stats)
+    total_active = sum(s["last_active"] for s in uni_stats)
+    total_cum    = sum(s["cumulative"]  for s in uni_stats)
 
     lines = [
         f"# 📊 Отчёт по ВУЗам — {today_str}",
         "",
-        f"**Период отчёта:** {prev_label} → {last_label}",
-        f"**Активные пользователи** = уникальные посетители за месяц (Яндекс Метрика)",
+        f"**Период:** {last_lbl}",
+        f"**Сравнение с:** {prev_lbl}",
+        "",
+        f"> **Активный пользователь** = совершил 3 и более визитов за месяц",
+        f"> **Новый пользователь** = первый визит за всю историю (Яндекс Метрика)",
         "",
         "## Сводка",
         "",
-        f"| | Значение |",
-        f"|---|---|",
+        "| Показатель | Значение |",
+        "|---|---|",
         f"| ВУЗов в реестре | {len(unique_slugs)} |",
-        f"| Уников накопленно (с 2024-01-01) | **{total_cum}** |",
-        f"| Активных за {last_label} | **{total_last}** |",
+        f"| Накопленно уников (с 2024-01-01) | **{total_cum}** |",
+        f"| Всего посетителей за {last_lbl} | **{total_all}** |",
+        f"| Новых за {last_lbl} | **{total_new}** |",
+        f"| Активных (3+ визитов) за {last_lbl} | **{total_active}** |",
         "",
         "---",
         "",
         "## Таблица по ВУЗам",
         "",
-        f"Период: **{last_label}** (новые и активные пользователи)",
-        f"Прирост: сравнение с **{prev_label}**",
-        "",
-        f"| № | ВУЗ | Накопленно | Активных за {last_label} | Прирост vs {prev_label} | Рекомендации |",
-        f"|---|---|---|---|---|---|",
+        f"| № | ВУЗ | Накопленно | Новых за {last_lbl} | Активных за {last_lbl} | Все посетители за {last_lbl} | Прирост vs {prev_lbl} | Рекомендации |",
+        "|---|---|---|---|---|---|---|---|",
     ]
 
     for i, slug in enumerate(unique_slugs, 1):
         s    = stats_map.get(slug)
-        name = UNI_REGISTRY[slug]
+        name = UNI_REGISTRY.get(slug, slug)
 
-        if s:
-            cum   = s["cumulative"]
-            last  = s["last_users"]
-            g     = s["growth"]
-            gp    = s["growth_pct"]
-            rec   = make_recommendation(s)
+        if s and s["last_all"] > 0:
+            cum    = s["cumulative"]
+            new_u  = s["last_new"]
+            active = s["last_active"]
+            all_u  = s["last_all"]
+            g      = s["growth"]
+            gp     = s["growth_pct"]
+            rec    = make_recommendation(s)
 
             if gp is not None:
-                sign   = "+" if g >= 0 else ""
-                trend  = f"{sign}{g} ({sign}{gp}%)"
-                emoji  = "📈" if g > 0 else ("📉" if g < 0 else "➡️")
-                growth_cell = f"{emoji} {trend}"
+                sign  = "+" if g >= 0 else ""
+                emoji = "📈" if g > 0 else ("📉" if g < 0 else "➡️")
+                trend = f"{emoji} {sign}{g} ({sign}{gp}%)"
             else:
-                growth_cell = "—"
+                trend = "—"
         else:
-            cum         = "—"
-            last        = "—"
-            growth_cell = "—"
-            rec         = "Нет данных в Метрике"
+            cum = all_u = new_u = active = "—"
+            trend = "—"
+            rec = "Нет данных в Метрике"
 
-        lines.append(f"| {i} | {name} | {cum} | {last} | {growth_cell} | {rec} |")
+        lines.append(f"| {i} | {name} | {cum} | {new_u} | {active} | {all_u} | {trend} | {rec} |")
 
-    lines += [
-        "",
-        "---",
-        "",
-        "## Динамика по месяцам",
-        "",
-    ]
+    lines += ["", "---", "", "## Динамика по месяцам", ""]
 
-    # Детальная динамика по каждому ВУЗу с данными
     for slug in unique_slugs:
         s = stats_map.get(slug)
         if not s or not s.get("monthly"):
@@ -305,18 +313,17 @@ def render_markdown_table(uni_stats: list[dict]) -> str:
         if all(m["users"] == 0 for m in s["monthly"]):
             continue
 
-        name = s["name"]
-        lines += [f"### 🎓 {name}", ""]
-        lines += ["| Месяц | Активных пользователей |", "|---|---|"]
+        lines += [f"### 🎓 {s['name']}", "",
+                  "| Месяц | Все посетители |", "|---|---|"]
         for m in s["monthly"][-3:]:
             lines.append(f"| {month_label(m['month'])} | {m['users']} |")
 
         top = s.get("top_products", {})
         if top:
-            lines += ["", f"**Топ продуктов за {last_label}:**", ""]
-            lines += ["| Продукт | Пользователей |", "|---|---|"]
-            for pname, pcount in top.items():
-                lines.append(f"| {pname} | {pcount} |")
+            lines += ["", f"**Топ продуктов за {last_lbl}:**", "",
+                      "| Продукт | Посетителей |", "|---|---|"]
+            for pname, cnt in top.items():
+                lines.append(f"| {pname} | {cnt} |")
         lines.append("")
 
     return "\n".join(lines)
@@ -335,30 +342,27 @@ def save_markdown(uni_stats: list[dict]) -> Path:
 def save_report_files(uni_stats: list[dict]) -> list[Path]:
     saved = []
     try:
-        md = save_markdown(uni_stats)
-        saved.append(md)
+        saved.append(save_markdown(uni_stats))
     except Exception:
-        log.error("Ошибка markdown:\n%s", traceback.format_exc())
+        log.error("Markdown:\n%s", traceback.format_exc())
 
     reports_dir = Path("reports")
     reports_dir.mkdir(exist_ok=True)
     ts = datetime.now().strftime("%Y-%m-%d_%H-%M")
 
     try:
-        png = chart_all_unis_growth(uni_stats)
+        png = chart_all_unis(uni_stats)
         p   = reports_dir / f"{ts}_unis_growth.png"
-        p.write_bytes(png)
-        saved.append(p)
+        p.write_bytes(png); saved.append(p)
     except Exception:
-        log.error("Ошибка общего графика:\n%s", traceback.format_exc())
+        log.error("Общий график:\n%s", traceback.format_exc())
 
     for s in uni_stats:
         try:
             png = chart_uni_products(s)
             if png:
                 p = reports_dir / f"{ts}_{s['slug']}_products.png"
-                p.write_bytes(png)
-                saved.append(p)
+                p.write_bytes(png); saved.append(p)
         except Exception:
             log.warning("График %s:\n%s", s["slug"], traceback.format_exc())
 
@@ -372,89 +376,69 @@ def _style(ax, title: str):
     ax.spines["top"].set_visible(False)
     ax.spines["right"].set_visible(False)
     ax.yaxis.set_major_formatter(
-        mticker.FuncFormatter(lambda x, _: f"{int(x):,}".replace(",", "\u202f"))
+        mticker.FuncFormatter(lambda x, _: str(int(x)))
     )
     ax.grid(axis="y", alpha=0.3, linestyle="--")
 
 
-def chart_all_unis_growth(uni_stats: list[dict]) -> bytes:
-    """Grouped bar по последним 3 завершённым месяцам."""
-    active = [s for s in uni_stats if s.get("monthly") and any(m["users"] > 0 for m in s["monthly"])]
+def chart_all_unis(uni_stats: list[dict]) -> bytes:
+    """Grouped bar: все/новые/активные за последний месяц по каждому ВУЗу."""
+    active = [s for s in uni_stats if s.get("last_all", 0) > 0]
     if not active:
-        active = uni_stats
+        return _empty_chart("Нет данных")
 
-    # Собираем месяцы (только завершённые)
-    today_ym = date.today().strftime("%Y-%m")
-    all_months_set: set[str] = set()
-    for s in active:
-        for m in s.get("monthly", []):
-            if m["month"] != today_ym:
-                all_months_set.add(m["month"])
-    all_months = sorted(all_months_set)[-3:]
+    active = sorted(active, key=lambda s: -s["last_all"])[:10]
+    names  = [s["name"].split("(")[0].strip()[:20] for s in active]
+    all_v  = [s["last_all"]    for s in active]
+    new_v  = [s["last_new"]    for s in active]
+    act_v  = [s["last_active"] for s in active]
 
-    if not all_months:
-        # Fallback — пустой график
-        fig, ax = plt.subplots(figsize=(8, 4))
-        ax.text(0.5, 0.5, "Нет данных", ha="center", va="center", transform=ax.transAxes)
-        buf = io.BytesIO()
-        fig.savefig(buf, format="png", dpi=100)
-        plt.close(fig)
-        buf.seek(0)
-        return buf.read()
+    x     = np.arange(len(active))
+    w     = 0.25
+    fig, ax = plt.subplots(figsize=(max(10, len(active) * 1.5), 6))
 
-    n_unis   = len(active)
-    n_months = len(all_months)
-    x        = np.arange(n_months)
-    bar_w    = min(0.8 / max(n_unis, 1), 0.15)
-    colors   = plt.cm.tab20.colors
+    ax.bar(x - w, all_v, w, label="Все посетители", color="#5B8DD9", alpha=0.85)
+    ax.bar(x,     new_v, w, label="Новые",           color="#5BAD84", alpha=0.85)
+    ax.bar(x + w, act_v, w, label="Активные (3+)",   color="#E06B5A", alpha=0.85)
 
-    fig, ax = plt.subplots(figsize=(max(10, n_months * 3), 6))
-
-    for i, s in enumerate(active):
-        month_map = {m["month"]: m["users"] for m in s.get("monthly", [])}
-        values    = [month_map.get(m, 0) for m in all_months]
-        offset    = (i - n_unis / 2 + 0.5) * bar_w
-        bars      = ax.bar(x + offset, values, bar_w,
-                           label=s["name"], color=colors[i % len(colors)], alpha=0.85)
-        for bar, v in zip(bars, values):
+    for xi, (a, n, ac) in enumerate(zip(all_v, new_v, act_v)):
+        for offset, v in [(-w, a), (0, n), (w, ac)]:
             if v > 0:
-                ax.text(bar.get_x() + bar.get_width() / 2,
-                        bar.get_height() + 0.3,
-                        str(v), ha="center", va="bottom", fontsize=7)
+                ax.text(xi + offset, v + 0.2, str(v),
+                        ha="center", va="bottom", fontsize=7)
 
-    labels = [f"{month_label(m)}" for m in all_months]
+    sample   = next((s for s in uni_stats if s.get("last_ym")), None)
+    last_lbl = month_label(sample["last_ym"]) if sample else ""
+
     ax.set_xticks(x)
-    ax.set_xticklabels(labels, fontsize=10)
-    _style(ax, "Активные пользователи по ВУЗам (завершённые месяцы)")
-    ax.legend(loc="upper left", fontsize=8, ncol=2)
+    ax.set_xticklabels(names, rotation=20, ha="right", fontsize=9)
+    _style(ax, f"Пользователи по ВУЗам — {last_lbl}")
+    ax.legend(fontsize=9)
     fig.tight_layout()
 
-    buf = io.BytesIO()
-    fig.savefig(buf, format="png", dpi=130, bbox_inches="tight")
-    plt.close(fig)
-    buf.seek(0)
-    return buf.read()
+    return _fig_to_bytes(fig)
 
 
 def chart_uni_products(s: dict) -> bytes | None:
-    """Stacked bar: продукты ВУЗа по завершённым месяцам."""
     pm = s.get("product_monthly", {})
     if not pm:
         return None
 
     today_ym = date.today().strftime("%Y-%m")
-    all_ms   = sorted({r["month"] for recs in pm.values() for r in recs if r["month"] != today_ym})[-3:]
+    all_ms   = sorted({r["month"] for recs in pm.values() for r in recs
+                       if r["month"] != today_ym})[-3:]
     if not all_ms:
         return None
 
-    totals       = {p: sum(r["users"] for r in recs if r["month"] != today_ym) for p, recs in pm.items()}
+    totals       = {p: sum(r["users"] for r in recs if r["month"] != today_ym)
+                    for p, recs in pm.items()}
     top_products = sorted(totals, key=lambda p: -totals[p])[:8]
     if not any(totals[p] > 0 for p in top_products):
         return None
 
-    x     = np.arange(len(all_ms))
-    bar_w = 0.5
-    fig, ax = plt.subplots(figsize=(max(8, len(all_ms) * 3), 5))
+    x      = np.arange(len(all_ms))
+    bar_w  = 0.5
+    fig, ax = plt.subplots(figsize=(max(8, len(all_ms) * 2.5), 5))
     bottom  = np.zeros(len(all_ms))
 
     for i, prefix in enumerate(top_products):
@@ -462,17 +446,27 @@ def chart_uni_products(s: dict) -> bytes | None:
         values    = np.array([month_map.get(m, 0) for m in all_ms], dtype=float)
         if values.sum() == 0:
             continue
-        label = _prettify_prefix(prefix, "")
         ax.bar(x, values, bar_w, bottom=bottom,
-               label=label, color=PRODUCT_COLORS[i % len(PRODUCT_COLORS)], alpha=0.85)
+               label=_prettify_prefix(prefix, ""),
+               color=PRODUCT_COLORS[i % len(PRODUCT_COLORS)], alpha=0.85)
         bottom += values
 
     ax.set_xticks(x)
-    ax.set_xticklabels([month_label(m) for m in all_ms], fontsize=10)
-    _style(ax, f"{s['name']} — пользователи по продуктам")
+    ax.set_xticklabels([month_label(m) for m in all_ms])
+    _style(ax, f"{s['name']} — посетители по продуктам")
     ax.legend(loc="upper left", fontsize=8)
     fig.tight_layout()
+    return _fig_to_bytes(fig)
 
+
+def _empty_chart(text: str) -> bytes:
+    fig, ax = plt.subplots(figsize=(8, 4))
+    ax.text(0.5, 0.5, text, ha="center", va="center", transform=ax.transAxes, fontsize=14)
+    ax.axis("off")
+    return _fig_to_bytes(fig)
+
+
+def _fig_to_bytes(fig) -> bytes:
     buf = io.BytesIO()
     fig.savefig(buf, format="png", dpi=130, bbox_inches="tight")
     plt.close(fig)
@@ -482,9 +476,9 @@ def chart_uni_products(s: dict) -> bytes | None:
 
 # ── Telegram ──────────────────────────────────────────────────────────────────
 
-def _tg_post(base_url: str, method: str, **kwargs) -> dict:
+def _tg(base: str, method: str, **kwargs) -> dict:
     try:
-        r = req_lib.post(f"{base_url}/{method}", timeout=30, **kwargs)
+        r = req_lib.post(f"{base}/{method}", timeout=30, **kwargs)
         r.raise_for_status()
         return r.json()
     except Exception as e:
@@ -495,76 +489,64 @@ def _tg_post(base_url: str, method: str, **kwargs) -> dict:
 def send_report_to_telegram(token: str, chat_id, uni_stats: list[dict]):
     base = f"https://api.telegram.org/bot{token}"
 
-    def send_text(text: str):
-        for chunk in _split(text, 4000):
-            _tg_post(base, "sendMessage",
-                     json={"chat_id": chat_id, "text": chunk, "parse_mode": "Markdown"})
+    def text(t: str):
+        for chunk in _split(t):
+            _tg(base, "sendMessage",
+                json={"chat_id": chat_id, "text": chunk, "parse_mode": "Markdown"})
             time.sleep(0.3)
 
-    def send_photo(png: bytes, caption: str = ""):
-        log.info("📤 Отправка графика %d байт...", len(png))
-        r = _tg_post(base, "sendPhoto",
-                     data={"chat_id": chat_id, "caption": caption},
-                     files={"photo": ("chart.png", png, "image/png")})
-        if r.get("ok"):
-            log.info("✅ График отправлен")
-        else:
-            log.error("❌ sendPhoto: %s", r)
+    def photo(png: bytes, cap: str = ""):
+        log.info("📤 График %d байт...", len(png))
+        r = _tg(base, "sendPhoto",
+                data={"chat_id": chat_id, "caption": cap},
+                files={"photo": ("chart.png", png, "image/png")})
+        log.info("✅ График" if r.get("ok") else f"❌ sendPhoto: {r}")
         time.sleep(0.5)
 
-    def send_document(path: Path, caption: str = ""):
-        log.info("📤 Отправка документа %s...", path.name)
-        r = _tg_post(base, "sendDocument",
-                     data={"chat_id": chat_id, "caption": caption},
-                     files={"document": (path.name, path.read_bytes(), "text/markdown")})
-        if r.get("ok"):
-            log.info("✅ Документ отправлен")
-        else:
-            log.error("❌ sendDocument: %s", r)
+    def document(path: Path, cap: str = ""):
+        log.info("📤 Документ %s...", path.name)
+        r = _tg(base, "sendDocument",
+                data={"chat_id": chat_id, "caption": cap},
+                files={"document": (path.name, path.read_bytes(), "text/markdown")})
+        log.info("✅ Документ" if r.get("ok") else f"❌ sendDocument: {r}")
 
-    # 1. Короткий дайджест текстом
-    sample = next((s for s in uni_stats if s.get("last_ym")), None)
-    if sample:
-        last_lbl = month_label(sample["last_ym"])
-        prev_lbl = month_label(sample["prev_ym"])
-    else:
-        last_lbl = prev_lbl = "—"
+    sample   = next((s for s in uni_stats if s.get("last_ym")), None)
+    last_lbl = month_label(sample["last_ym"]) if sample else "—"
+    prev_lbl = month_label(sample["prev_ym"]) if sample else "—"
 
-    total_last = sum(s["last_users"] for s in uni_stats)
-    total_cum  = sum(s["cumulative"] for s in uni_stats)
+    total_all    = sum(s["last_all"]    for s in uni_stats)
+    total_new    = sum(s["last_new"]    for s in uni_stats)
+    total_active = sum(s["last_active"] for s in uni_stats)
+    total_cum    = sum(s["cumulative"]  for s in uni_stats)
 
-    digest = [
+    digest = "\n".join([
         f"📊 *Отчёт по ВУЗам — {datetime.now().strftime('%d.%m.%Y')}*",
-        f"Период: *{prev_lbl}* → *{last_lbl}*",
+        f"Период: *{last_lbl}* | Сравнение с *{prev_lbl}*",
         "",
-        f"🏛 ВУЗов: *{len(set(UNI_REGISTRY.values()))}* в реестре",
-        f"👥 Уников накопленно: *{total_cum}*",
-        f"🟢 Активных за {last_lbl}: *{total_last}*",
+        f"👥 Накопленно уников: *{total_cum}*",
+        f"🆕 Новых за {last_lbl}: *{total_new}*",
+        f"🔥 Активных (3+ визитов): *{total_active}*",
+        f"👁 Всего посетителей: *{total_all}*",
         "",
-        "Подробный отчёт с таблицами — в прикреплённом файле 👇",
-    ]
-    send_text("\n".join(digest))
+        "📄 Подробная таблица — в прикреплённом файле",
+    ])
+    text(digest)
 
-    # 2. Общий график
     try:
-        png = chart_all_unis_growth(uni_stats)
-        send_photo(png, f"📊 Активные пользователи по ВУЗам")
+        photo(chart_all_unis(uni_stats), f"Пользователи по ВУЗам — {last_lbl}")
     except Exception:
         log.error("Общий график:\n%s", traceback.format_exc())
 
-    # 3. Markdown-файл
     md_path = save_markdown(uni_stats)
-    send_document(md_path, "📄 Полный отчёт по ВУЗам (таблицы + рекомендации)")
+    document(md_path, f"Отчёт по ВУЗам {last_lbl}")
 
-    # 4. Графики по ВУЗам
-    sorted_stats = sorted(uni_stats, key=lambda s: -s.get("last_users", 0))
-    for s in sorted_stats:
-        if s.get("last_users", 0) == 0:
+    for s in sorted(uni_stats, key=lambda s: -s.get("last_all", 0)):
+        if s.get("last_all", 0) == 0:
             continue
         try:
             png = chart_uni_products(s)
             if png:
-                send_photo(png, f"📦 {s['name']}")
+                photo(png, s["name"])
         except Exception:
             log.warning("График %s:\n%s", s["slug"], traceback.format_exc())
 
@@ -574,13 +556,11 @@ def send_report_to_telegram(token: str, chat_id, uni_stats: list[dict]):
 def _split(text: str, limit: int = 4000) -> list[str]:
     if len(text) <= limit:
         return [text]
-    chunks, current, cur_len = [], [], 0
+    chunks, cur, cur_len = [], [], 0
     for line in text.split("\n"):
         if cur_len + len(line) + 1 > limit:
-            chunks.append("\n".join(current))
-            current, cur_len = [], 0
-        current.append(line)
-        cur_len += len(line) + 1
-    if current:
-        chunks.append("\n".join(current))
+            chunks.append("\n".join(cur)); cur, cur_len = [], 0
+        cur.append(line); cur_len += len(line) + 1
+    if cur:
+        chunks.append("\n".join(cur))
     return chunks
