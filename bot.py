@@ -344,19 +344,10 @@ async def cmd_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_allowed(update):
         return
     uid = update.effective_user.id
-    cid = state(uid).get("counter_id") or DEFAULT_COUNTER_ID
 
-    if not cid:
-        await update.message.reply_text("⚠️ Сначала выберите счётчик через /start")
-        return
-
-    metrika = base_metrika.with_counter(cid)
-    if not metrika.is_layered():
-        await update.message.reply_text(
-            "⚠️ Отчёт по ВУЗам доступен только для счётчика *Сфера для вузов* (102372602).",
-            parse_mode=ParseMode.MARKDOWN,
-        )
-        return
+    # Всегда используем layered счётчик для этого отчёта
+    LAYERED_COUNTER = 102372602
+    metrika = base_metrika.with_counter(LAYERED_COUNTER)
 
     status_msg = await update.message.reply_text(
         "📊 Формирую отчёт по ВУЗам...\n\n"

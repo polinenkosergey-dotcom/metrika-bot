@@ -55,10 +55,20 @@ UNI_SLUG_MERGE: dict[str, str] = {
 }
 
 # Служебные субдомены — не ВУЗы
+# gateway-* — прокси/технические инстансы, не учебные
 UNI_SKIP_SLUGS: set[str] = {
-    "lk", "start", "saas", "gateway-codemetrics", "gateway-test",
-    "gateway-beta", "gamma",
+    "lk", "start", "saas", "gamma",
+    "gateway-codemetrics", "gateway-test", "gateway-beta",
+    "gateway-mai", "gateway-sut", "gateway-istu", "gateway-nsu",
+    "gateway-fta", "gateway-fa", "gateway-kstu", "gateway-urfu",
+    "gateway-kubsu", "gateway-iu10", "gateway-nnov", "gateway-rsreu",
+    "gateway-unn", "gateway-bmstu", "gateway-innopolis", "gateway-hkton",
+    "gateway-ngieu", "gateway-iu10",
 }
+
+def _is_gateway_slug(slug: str) -> bool:
+    """Любой субдомен начинающийся с gateway- считается служебным."""
+    return slug.startswith("gateway-")
 
 
 class MetrikaClient:
@@ -214,7 +224,7 @@ class MetrikaClient:
                 continue
             host, _ = parsed
             slug = self._uni_slug_from_host(host)
-            if not slug or slug in UNI_SKIP_SLUGS:
+            if not slug or slug in UNI_SKIP_SLUGS or _is_gateway_slug(slug):
                 continue
             # Применяем merge: fta -> fa
             canonical = UNI_SLUG_MERGE.get(slug, slug)
