@@ -117,17 +117,29 @@ class AnalystAgent:
     def _run_tool(self, name: str, args: dict) -> Any:
         prefix = args.get("url_prefix") or None
         host = args.get("filter_host") or None
-        hosts = args.get("filter_hosts") or None
-        log.info("🔧 %s | prefix=%s | hosts=%s", name, prefix, hosts or host)
+        hosts_raw = args.get("filter_hosts")
+
+        # Нормализуем: Claude иногда передаёт строку вместо списка
+        if isinstance(hosts_raw, str) and hosts_raw:
+            hosts = [hosts_raw]
+        elif isinstance(hosts_raw, list) and hosts_raw:
+            hosts = hosts_raw
+        else:
+            hosts = None
+
+        # Если hosts не задан, но есть одиночный host — используем его как список
+        effective_hosts = hosts or ([host] if host else None)
+
+        log.info("🔧 %s | prefix=%s | hosts=%s", name, prefix, effective_hosts)
 
         if name == "get_summary_metrics":
-            return self.metrika.get_summary(prefix, host, hosts)
+            return self.metrika.get_summary(prefix, host, effective_hosts)
         elif name == "get_traffic_sources":
-            return self.metrika.get_traffic_sources(prefix, host, hosts)
+            return self.metrika.get_traffic_sources(prefix, host, effective_hosts)
         elif name == "get_top_pages":
-            return self.metrika.get_top_pages(prefix, host, hosts, args.get("limit", 10))
+            return self.metrika.get_top_pages(prefix, host, effective_hosts, args.get("limit", 10))
         elif name == "get_devices":
-            return self.metrika.get_devices(prefix, host, hosts)
+            return self.metrika.get_devices(prefix, host, effective_hosts)
         return {"error": f"unknown tool: {name}"}
 
     def run(self, user_message: str, status_callback=None) -> str:
