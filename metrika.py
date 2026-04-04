@@ -30,6 +30,36 @@ LAYERED_BASE_DOMAINS = [
     "sferaplatform.ru",
 ]
 
+# Субдомен → человекочитаемое название ВУЗа
+UNI_REGISTRY: dict[str, str] = {
+    "mai":   "МАИ",
+    "urfu":  "УрФУ им. Ельцина (Екатеринбург)",
+    "sut":   "СПбГУТ им. Бонч-Бруевича (Санкт-Петербург)",
+    "nsu":   "НГУ (Новосибирск)",
+    "istu":  "ИжГТУ им. Калашникова (Ижевск)",
+    "kubsu": "КубГУ (Краснодар)",
+    "kstu":  "КНИТУ (Казань)",
+    "rsreu": "РГРТУ им. Уткина (Рязань)",
+    "bmstu": "МГТУ им. Баумана",
+    "unn":   "ННГУ им. Лобачевского (Нижний Новгород)",
+    "fa":    "Финансовый университет (Москва)",
+    "fta":   "Финансовый университет (Москва)",
+    # Подключены, но трафика пока нет:
+    # "innopolis" -> Университет Иннополис
+    # hse-nn, hse-perm, ssau, ngieu — при появлении добавить сюда
+}
+
+# Субдомены которые сливаются в один ВУЗ: slug -> канонический slug
+UNI_SLUG_MERGE: dict[str, str] = {
+    "fta": "fa",  # хакатонный инстанс -> Финансовый университет
+}
+
+# Служебные субдомены — не ВУЗы
+UNI_SKIP_SLUGS: set[str] = {
+    "lk", "start", "saas", "gateway-codemetrics", "gateway-test",
+    "gateway-beta", "gamma",
+}
+
 
 class MetrikaClient:
     def __init__(self, token: str, counter_id: int | None = None):
@@ -166,13 +196,17 @@ class MetrikaClient:
     def discover_unis(self, days: int = 60) -> list[dict]:
         """
         Layered: возвращает список ВУЗов по субдоменам.
-        mai.saas.sferaplatform.ru/... → ВУЗ 'MAI'
+        Использует UNI_REGISTRY для человекочитаемых названий.
+        Объединяет субдомены из UNI_SLUG_MERGE (fta -> fa).
+        Пропускает служебные субдомены из UNI_SKIP_SLUGS.
         """
         assert self.counter_id
         rows = self._fetch_top_urls(days)
 
+        # canonical_slug -> visits
         uni_visits: dict[str, int] = defaultdict(int)
-        uni_hosts: dict[str, str] = {}
+        # canonical_slug -> список хостов (для построения фильтра)
+        uni_hosts: dict[str, list[str]] = defaultdict(list)
 
         for row in rows:
             parsed = _safe_parse(row["url"])
@@ -180,46 +214,62 @@ class MetrikaClient:
                 continue
             host, _ = parsed
             slug = self._uni_slug_from_host(host)
-            if not slug:
+            if not slug or slug in UNI_SKIP_SLUGS:
                 continue
-            uni_visits[slug] += row["visits"]
-            uni_hosts[slug] = host  # запоминаем полный хост
+            # Применяем merge: fta -> fa
+            canonical = UNI_SLUG_MERGE.get(slug, slug)
+            uni_visits[canonical] += row["visits"]
+            if host not in uni_hosts[canonical]:
+                uni_hosts[canonical].append(host)
 
         unis = []
         for slug, visits in sorted(uni_visits.items(), key=lambda x: -x[1]):
             if visits < MIN_VISITS_THRESHOLD:
                 continue
+            name = UNI_REGISTRY.get(slug, slug.upper())
+            hosts = uni_hosts[slug]
             unis.append({
-                "name": slug.upper(),           # 'mai' → 'MAI'
-                "slug": slug,                   # 'mai'
-                "host": uni_hosts[slug],        # 'mai.saas.sferaplatform.ru'
-                "url_prefix": None,             # фильтр по хосту, не по пути
+                "name": name,
+                "slug": slug,
+                "hosts": hosts,       # список всех хостов (может быть несколько после merge)
+                "host": hosts[0],     # основной хост (для обратной совместимости)
+                "url_prefix": None,
                 "visits": visits,
             })
         return unis
 
     def discover_products_for_uni(self, uni_slug: str, days: int = 60) -> list[dict]:
         """
-        Layered: продукты конкретного ВУЗа = первый сегмент пути на его субдомене.
-        mai.saas.sferaplatform.ru/tasks/... → продукт 'Задачи', prefix='/tasks'
-        Фильтр в Метрике: startURL содержит 'https://mai.saas.sferaplatform.ru/tasks'
+        Layered: продукты конкретного ВУЗа.
+        Учитывает merge: если uni_slug='fa', собирает данные и с fa, и с fta хостов.
+        filter_hosts — список всех хостов ВУЗа (используется при построении фильтра).
         """
         assert self.counter_id
         rows = self._fetch_top_urls(days)
 
+        # Собираем все slug-и которые относятся к этому ВУЗу
+        target_slugs = {uni_slug}
+        for src, dst in UNI_SLUG_MERGE.items():
+            if dst == uni_slug:
+                target_slugs.add(src)
+
         prefix_visits: dict[str, int] = defaultdict(int)
-        uni_host = ""
+        found_hosts: list[str] = []
 
         for row in rows:
             parsed = _safe_parse(row["url"])
             if not parsed:
                 continue
             host, parts = parsed
-            if self._uni_slug_from_host(host) != uni_slug:
+            raw_slug = self._uni_slug_from_host(host)
+            if raw_slug not in target_slugs:
                 continue
-            uni_host = host
+            if host not in found_hosts:
+                found_hosts.append(host)
             prefix = "/" + parts[0] if parts else "/"
             prefix_visits[prefix] += row["visits"]
+
+        uni_name = UNI_REGISTRY.get(uni_slug, uni_slug.upper())
 
         products = []
         for prefix, visits in sorted(prefix_visits.items(), key=lambda x: -x[1]):
@@ -227,9 +277,11 @@ class MetrikaClient:
                 continue
             products.append({
                 "name": _prettify_prefix(prefix, ""),
-                "url_prefix": prefix,       # '/tasks'
-                "uni": uni_slug,            # 'mai'
-                "filter_host": uni_host,    # 'mai.saas.sferaplatform.ru' — для фильтра
+                "url_prefix": prefix,
+                "uni": uni_slug,
+                "uni_name": uni_name,
+                "filter_hosts": found_hosts,   # все хосты ВУЗа
+                "filter_host": found_hosts[0] if found_hosts else "",
                 "visits": visits,
             })
         return products
@@ -244,32 +296,47 @@ class MetrikaClient:
     # ── Построение фильтра ────────────────────────────────────────────────────
 
     @staticmethod
-    def _make_filter(url_prefix: str | None, filter_host: str | None) -> str | None:
+    def _make_filter(
+        url_prefix: str | None,
+        filter_host: str | None,
+        filter_hosts: list[str] | None = None,
+    ) -> str | None:
         """
         Строит строку фильтра для Метрики.
-        filter_host='mai.saas.sferaplatform.ru', url_prefix='/tasks'
-          → "ym:s:startURL=@'https://mai.saas.sferaplatform.ru/tasks'"
-        filter_host='mai.saas.sferaplatform.ru', url_prefix=None
-          → "ym:s:startURL=@'https://mai.saas.sferaplatform.ru/'"
-        filter_host=None, url_prefix='/tasks'
-          → "ym:s:startURL=@'/tasks'"
+
+        filter_hosts — список хостов (для ВУЗов с несколькими инстансами, напр. fa+fta).
+        Если передан filter_hosts, строит OR-фильтр по всем хостам.
+
+        Примеры:
+          filter_host='mai...', url_prefix='/tasks'
+            → "ym:s:startURL=@'https://mai.../tasks'"
+          filter_hosts=['fa...', 'fta...'], url_prefix='/tasks'
+            → "ym:s:startURL=@'https://fa.../tasks' OR ym:s:startURL=@'https://fta.../tasks'"
+          filter_host='mai...', url_prefix=None
+            → "ym:s:startURL=@'https://mai.../'  "
+          filter_host=None, url_prefix='/tasks'
+            → "ym:s:startURL=@'/tasks'"
         """
-        if filter_host and url_prefix:
-            return f"ym:s:startURL=@'https://{filter_host}{url_prefix}'"
-        if filter_host:
-            return f"ym:s:startURL=@'https://{filter_host}/'"
+        hosts = filter_hosts or ([filter_host] if filter_host else [])
+
+        if hosts and url_prefix:
+            parts = [f"ym:s:startURL=@'https://{h}{url_prefix}'" for h in hosts]
+            return " OR ".join(parts)
+        if hosts:
+            parts = [f"ym:s:startURL=@'https://{h}/'" for h in hosts]
+            return " OR ".join(parts)
         if url_prefix:
             return f"ym:s:startURL=@'{url_prefix}'"
         return None
 
     # ── Метрики ───────────────────────────────────────────────────────────────
 
-    def get_summary(self, url_prefix: str | None = None, filter_host: str | None = None) -> dict:
+    def get_summary(self, url_prefix: str | None = None, filter_host: str | None = None, filter_hosts: list[str] | None = None) -> dict:
         assert self.counter_id
         metrics = "ym:s:visits,ym:s:users,ym:s:bounceRate,ym:s:pageDepth,ym:s:avgVisitDurationSeconds"
         result = {}
 
-        flt = self._make_filter(url_prefix, filter_host)
+        flt = self._make_filter(url_prefix, filter_host, filter_hosts)
 
         for label, offset in [("this_week", 0), ("last_week", 1)]:
             d1, d2 = self.week_range(offset)
@@ -308,7 +375,7 @@ class MetrikaClient:
         result["wow_delta"] = deltas
         return result
 
-    def get_traffic_sources(self, url_prefix: str | None = None, filter_host: str | None = None) -> list[dict]:
+    def get_traffic_sources(self, url_prefix: str | None = None, filter_host: str | None = None, filter_hosts: list[str] | None = None) -> list[dict]:
         assert self.counter_id
         d1, d2 = self.week_range(0)
         params = {
@@ -320,7 +387,7 @@ class MetrikaClient:
             "sort": "-ym:s:visits",
             "limit": 10,
         }
-        flt = self._make_filter(url_prefix, filter_host)
+        flt = self._make_filter(url_prefix, filter_host, filter_hosts)
         if flt:
             params["filters"] = flt
         try:
@@ -333,7 +400,7 @@ class MetrikaClient:
             log.warning("get_traffic_sources error: %s", e)
             return []
 
-    def get_top_pages(self, url_prefix: str | None = None, filter_host: str | None = None, limit: int = 10) -> list[dict]:
+    def get_top_pages(self, url_prefix: str | None = None, filter_host: str | None = None, filter_hosts: list[str] | None = None, limit: int = 10) -> list[dict]:
         assert self.counter_id
         d1, d2 = self.week_range(0)
         params = {
@@ -345,7 +412,7 @@ class MetrikaClient:
             "sort": "-ym:s:visits",
             "limit": limit,
         }
-        flt = self._make_filter(url_prefix, filter_host)
+        flt = self._make_filter(url_prefix, filter_host, filter_hosts)
         if flt:
             params["filters"] = flt
         try:
@@ -362,7 +429,7 @@ class MetrikaClient:
             log.warning("get_top_pages error: %s", e)
             return []
 
-    def get_devices(self, url_prefix: str | None = None, filter_host: str | None = None) -> list[dict]:
+    def get_devices(self, url_prefix: str | None = None, filter_host: str | None = None, filter_hosts: list[str] | None = None) -> list[dict]:
         assert self.counter_id
         d1, d2 = self.week_range(0)
         params = {
@@ -372,7 +439,7 @@ class MetrikaClient:
             "date1": d1,
             "date2": d2,
         }
-        flt = self._make_filter(url_prefix, filter_host)
+        flt = self._make_filter(url_prefix, filter_host, filter_hosts)
         if flt:
             params["filters"] = flt
         try:
@@ -387,6 +454,151 @@ class MetrikaClient:
 
 
 # ── Утилиты ───────────────────────────────────────────────────────────────────
+
+    # ── Исторические данные для отчётов ──────────────────────────────────────
+
+    def get_users_by_month(
+        self,
+        months: int = 3,
+        filter_hosts: list[str] | None = None,
+        filter_host: str | None = None,
+    ) -> list[dict]:
+        """
+        Уникальные пользователи помесячно за последние N месяцев.
+        Возвращает список {"month": "2026-02", "users": 1234}.
+        """
+        assert self.counter_id
+        from datetime import date
+        today = date.today()
+        result = []
+        for i in range(months - 1, -1, -1):
+            # Первый и последний день месяца
+            if today.month - i <= 0:
+                year = today.year - 1
+                month = today.month - i + 12
+            else:
+                year = today.year
+                month = today.month - i
+            import calendar
+            last_day = calendar.monthrange(year, month)[1]
+            d1 = f"{year:04d}-{month:02d}-01"
+            d2 = f"{year:04d}-{month:02d}-{last_day:02d}"
+            label = f"{year:04d}-{month:02d}"
+
+            flt = self._make_filter(None, filter_host, filter_hosts)
+            params = {
+                "ids": self.counter_id,
+                "metrics": "ym:s:users",
+                "date1": d1,
+                "date2": d2,
+                "accuracy": "full",
+            }
+            if flt:
+                params["filters"] = flt
+            try:
+                data = self._get("/stat/v1/data", params)
+                users = round(data.get("totals", [0])[0])
+            except Exception as e:
+                log.warning("get_users_by_month %s: %s", label, e)
+                users = 0
+            result.append({"month": label, "users": users})
+        return result
+
+    def get_cumulative_users(
+        self,
+        filter_hosts: list[str] | None = None,
+        filter_host: str | None = None,
+        since: str = "2024-01-01",
+    ) -> int:
+        """
+        Уникальные пользователи нарастающим итогом с даты since по сегодня.
+        Метрика считает уников за период — используем максимально широкий диапазон.
+        """
+        assert self.counter_id
+        from datetime import date
+        today = str(date.today())
+        flt = self._make_filter(None, filter_host, filter_hosts)
+        params = {
+            "ids": self.counter_id,
+            "metrics": "ym:s:users",
+            "date1": since,
+            "date2": today,
+            "accuracy": "full",
+        }
+        if flt:
+            params["filters"] = flt
+        try:
+            data = self._get("/stat/v1/data", params)
+            return round(data.get("totals", [0])[0])
+        except Exception as e:
+            log.warning("get_cumulative_users: %s", e)
+            return 0
+
+    def get_users_by_product_monthly(
+        self,
+        filter_hosts: list[str],
+        months: int = 3,
+    ) -> dict[str, list[dict]]:
+        """
+        Уникальные пользователи по каждому продукту (первый сегмент пути) помесячно.
+        Возвращает {product_prefix: [{"month": ..., "users": ...}]}.
+        """
+        assert self.counter_id
+        from datetime import date
+        import calendar
+        today = date.today()
+        result: dict[str, list[dict]] = {}
+
+        for i in range(months - 1, -1, -1):
+            if today.month - i <= 0:
+                year = today.year - 1
+                month = today.month - i + 12
+            else:
+                year = today.year
+                month = today.month - i
+            last_day = calendar.monthrange(year, month)[1]
+            d1 = f"{year:04d}-{month:02d}-01"
+            d2 = f"{year:04d}-{month:02d}-{last_day:02d}"
+            label = f"{year:04d}-{month:02d}"
+
+            flt = self._make_filter(None, None, filter_hosts)
+            params = {
+                "ids": self.counter_id,
+                "metrics": "ym:s:users",
+                "dimensions": "ym:s:startURL",
+                "date1": d1,
+                "date2": d2,
+                "sort": "-ym:s:users",
+                "limit": 100,
+                "accuracy": "full",
+            }
+            if flt:
+                params["filters"] = flt
+            try:
+                data = self._get("/stat/v1/data", params)
+            except Exception as e:
+                log.warning("get_users_by_product_monthly %s: %s", label, e)
+                continue
+
+            # Группируем по первому сегменту пути
+            from collections import defaultdict
+            prefix_users: dict[str, int] = defaultdict(int)
+            for row in data.get("data", []):
+                url = row["dimensions"][0].get("name", "")
+                parsed = _safe_parse(url)
+                if not parsed:
+                    continue
+                _, parts = parsed
+                prefix = "/" + parts[0] if parts else "/"
+                prefix_users[prefix] += round(row["metrics"][0])
+
+            for prefix, users in prefix_users.items():
+                if prefix not in result:
+                    result[prefix] = []
+                result[prefix].append({"month": label, "users": users})
+
+        return result
+
 
 def _safe_parse(url_str: str) -> tuple[str, list[str]] | None:
     try:

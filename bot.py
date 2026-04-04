@@ -33,6 +33,7 @@ from telegram.constants import ParseMode, ChatAction
 
 from metrika import MetrikaClient, LAYERED_COUNTERS
 from analyst import AnalystAgent
+from reporter import collect_uni_stats, send_report_to_telegram, save_report_files
 
 load_dotenv()
 
@@ -56,6 +57,10 @@ ALLOWED_USERS: set[int] = (
 )
 
 PER_PAGE = 8
+
+# Chat ID для автоматической ежемесячной рассылки отчёта
+# Если не задан — автоотчёт отключён
+REPORT_CHAT_ID = os.getenv("REPORT_CHAT_ID", "")
 
 # ── Состояние пользователей ───────────────────────────────────────────────────
 # { user_id: {
@@ -333,6 +338,78 @@ async def _discover_unis(update: Update, context: ContextTypes.DEFAULT_TYPE, met
 
 
 # ── Команды ───────────────────────────────────────────────────────────────────
+
+async def cmd_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Полный отчёт по ВУЗам: уники, прирост, графики."""
+    if not is_allowed(update):
+        return
+    uid = update.effective_user.id
+    cid = state(uid).get("counter_id") or DEFAULT_COUNTER_ID
+
+    if not cid:
+        await update.message.reply_text("⚠️ Сначала выберите счётчик через /start")
+        return
+
+    metrika = base_metrika.with_counter(cid)
+    if not metrika.is_layered():
+        await update.message.reply_text(
+            "⚠️ Отчёт по ВУЗам доступен только для счётчика *Сфера для вузов* (102372602).",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return
+
+    status_msg = await update.message.reply_text(
+        "📊 Формирую отчёт по ВУЗам...\n\n"
+        "⏳ Собираю данные из Метрики (~1-2 мин)"
+    )
+
+    try:
+        loop = asyncio.get_event_loop()
+
+        # Обнаруживаем ВУЗы
+        unis = await loop.run_in_executor(None, metrika.discover_unis)
+        if not unis:
+            await status_msg.edit_text("❌ ВУЗы не обнаружены в счётчике")
+            return
+
+        await status_msg.edit_text(
+            f"📊 Найдено ВУЗов: *{len(unis)}*\n"
+            f"⏳ Собираю метрики по каждому...",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+
+        # Собираем статистику по каждому ВУЗу
+        uni_stats = []
+        for i, uni in enumerate(unis):
+            await status_msg.edit_text(
+                f"📊 Обрабатываю {i+1}/{len(unis)}: *{uni['name']}*...",
+                parse_mode=ParseMode.MARKDOWN,
+            )
+            s = await loop.run_in_executor(
+                None, lambda u=uni: collect_uni_stats(metrika, u, months=3)
+            )
+            uni_stats.append(s)
+
+        await status_msg.edit_text("🖼 Строю графики и отправляю отчёт...")
+
+        # Сохраняем файлы
+        await loop.run_in_executor(None, lambda: save_report_files(uni_stats))
+
+        # Отправляем в Telegram
+        tg_token = os.environ["TELEGRAM_TOKEN"]
+        chat_id = update.effective_chat.id
+        await loop.run_in_executor(
+            None,
+            lambda: send_report_to_telegram(tg_token, chat_id, uni_stats, months=3)
+        )
+
+        await status_msg.edit_text("✅ Отчёт сформирован и отправлен")
+
+    except Exception as e:
+        log.exception("Ошибка /report")
+        await status_msg.edit_text(f"❌ Ошибка: {e}")
+
+
 
 async def cmd_product(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_allowed(update):
@@ -706,12 +783,15 @@ async def callback_analyze(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # Для layered-продуктов передаём filter_host чтобы агент использовал его в инструментах
     filter_host = product.get("filter_host") or ""
+    filter_hosts = product.get("filter_hosts") or ([filter_host] if filter_host else [])
     host_hint = ""
-    if filter_host:
+    if filter_hosts:
+        hosts_str = ", ".join(f"'{h}'" for h in filter_hosts)
         host_hint = (
             f"\nВАЖНО: это продукт ВУЗа. При каждом вызове инструментов передавай:\n"
             f"  url_prefix='{prefix}'\n"
-            f"  filter_host='{filter_host}'\n"
+            f"  filter_hosts=[{hosts_str}]\n"
+            + (f"  (и filter_host='{filter_hosts[0]}' как основной)\n" if filter_hosts else "")
         )
 
     prompt = (
@@ -810,16 +890,56 @@ async def _run_question(update: Update, context: ContextTypes.DEFAULT_TYPE, ques
 
 # ── Запуск ────────────────────────────────────────────────────────────────────
 
+async def _run_monthly_report(context) -> None:
+    """Автоматический ежемесячный отчёт по ВУЗам."""
+    chat_id = REPORT_CHAT_ID
+    if not chat_id:
+        return
+    log.info("⏰ Запускаю автоматический ежемесячный отчёт...")
+    try:
+        metrika = base_metrika.with_counter(102372602)
+        loop = asyncio.get_event_loop()
+        unis = await loop.run_in_executor(None, metrika.discover_unis)
+        uni_stats = []
+        for uni in unis:
+            s = await loop.run_in_executor(
+                None, lambda u=uni: collect_uni_stats(metrika, u, months=3)
+            )
+            uni_stats.append(s)
+        save_report_files(uni_stats)
+        await loop.run_in_executor(
+            None,
+            lambda: send_report_to_telegram(TELEGRAM_TOKEN, chat_id, uni_stats, months=3)
+        )
+        log.info("✅ Автоотчёт отправлен в %s", chat_id)
+    except Exception as e:
+        log.exception("Ошибка автоотчёта: %s", e)
+
+
 async def post_init(app: Application):
     await app.bot.set_my_commands([
         BotCommand("start",   "Выбрать счётчик и продукты"),
         BotCommand("counter", "Сменить счётчик"),
+        BotCommand("report",  "Отчёт по ВУЗам с графиками"),
         BotCommand("product", "Анализ продукта"),
         BotCommand("unis",    "Выбрать ВУЗ"),
         BotCommand("ask",     "Вопрос по данным"),
         BotCommand("status",  "Состояние"),
         BotCommand("help",    "Справка"),
     ])
+
+    # Ежемесячный автоотчёт — 1-го числа каждого месяца в 09:00
+    if REPORT_CHAT_ID:
+        from datetime import time as dtime
+        app.job_queue.run_monthly(
+            _run_monthly_report,
+            when=dtime(9, 0),
+            day=1,
+            name="monthly_uni_report",
+        )
+        log.info("⏰ Ежемесячный автоотчёт настроен → chat_id=%s", REPORT_CHAT_ID)
+    else:
+        log.info("Автоотчёт отключён (REPORT_CHAT_ID не задан)")
 
 
 def main():
@@ -835,6 +955,7 @@ def main():
     app.add_handler(CommandHandler("counter", cmd_counter))
     app.add_handler(CommandHandler("help",    cmd_help))
     app.add_handler(CommandHandler("status",  cmd_status))
+    app.add_handler(CommandHandler("report",  cmd_report))
     app.add_handler(CommandHandler("product", cmd_product))
     app.add_handler(CommandHandler("unis",    cmd_unis))
     app.add_handler(CommandHandler("ask",     cmd_ask))

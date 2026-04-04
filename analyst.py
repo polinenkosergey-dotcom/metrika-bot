@@ -32,9 +32,16 @@ TOOLS = [
                 "filter_host": {
                     "type": "string",
                     "description": (
-                        "Хост для фильтрации (только для layered-счётчиков). "
-                        "Например: mai.saas.sferaplatform.ru. "
-                        "Пустая строка если фильтр по хосту не нужен."
+                        "Основной хост для фильтрации (layered-счётчики). "
+                        "Например: mai.saas.sferaplatform.ru."
+                    ),
+                },
+                "filter_hosts": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": (
+                        "Список всех хостов ВУЗа (если несколько, напр. fa и fta). "
+                        "Используй вместо filter_host когда у ВУЗа несколько инстансов."
                     ),
                 },
             },
@@ -110,16 +117,17 @@ class AnalystAgent:
     def _run_tool(self, name: str, args: dict) -> Any:
         prefix = args.get("url_prefix") or None
         host = args.get("filter_host") or None
-        log.info("🔧 %s | prefix=%s | host=%s", name, prefix, host)
+        hosts = args.get("filter_hosts") or None
+        log.info("🔧 %s | prefix=%s | hosts=%s", name, prefix, hosts or host)
 
         if name == "get_summary_metrics":
-            return self.metrika.get_summary(prefix, host)
+            return self.metrika.get_summary(prefix, host, hosts)
         elif name == "get_traffic_sources":
-            return self.metrika.get_traffic_sources(prefix, host)
+            return self.metrika.get_traffic_sources(prefix, host, hosts)
         elif name == "get_top_pages":
-            return self.metrika.get_top_pages(prefix, host, args.get("limit", 10))
+            return self.metrika.get_top_pages(prefix, host, hosts, args.get("limit", 10))
         elif name == "get_devices":
-            return self.metrika.get_devices(prefix, host)
+            return self.metrika.get_devices(prefix, host, hosts)
         return {"error": f"unknown tool: {name}"}
 
     def run(self, user_message: str, status_callback=None) -> str:
