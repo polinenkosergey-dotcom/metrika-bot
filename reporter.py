@@ -174,8 +174,12 @@ def _fetch_monthly(metrika: MetrikaClient, hosts: list[str], months: int) -> lis
 
 
 def _top_products(product_monthly: dict, last_ym: str) -> dict:
+    from metrika import SKIP_PRODUCT_PATHS
     result = {}
     for prefix, records in product_monthly.items():
+        # Пропускаем служебные пути
+        if prefix in SKIP_PRODUCT_PATHS:
+            continue
         v = next((r["users"] for r in records if r["month"] == last_ym), 0)
         if v > 0:
             result[_prettify_prefix(prefix, "")] = v

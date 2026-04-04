@@ -330,11 +330,11 @@ class MetrikaClient:
         hosts = filter_hosts or ([filter_host] if filter_host else [])
 
         if hosts and url_prefix:
-            # Фильтруем по хосту И пути — без https:// чтобы ловить все страницы домена
+            # Фильтр по хосту И пути через маску
             parts = [f"ym:s:startURL=@'{h}{url_prefix}'" for h in hosts]
             return " OR ".join(parts)
         if hosts:
-            # Только по хосту — все страницы домена
+            # Маска *host* — ловит все страницы домена включая любой протокол и путь
             parts = [f"ym:s:startURL=@'{h}'" for h in hosts]
             return " OR ".join(parts)
         if url_prefix:
@@ -556,11 +556,17 @@ class MetrikaClient:
     ) -> int:
         """
         Активные пользователи = те кто совершил min_visits+ визитов за период.
-        Использует фильтр ym:s:visitNumber>={min_visits}.
+        Метрика: ym:s:users с фильтром ym:s:visits>={min_visits} на уровне визита.
+        Используем dimension ym:s:visitNumberSite (номер визита на сайте) — 
+        считаем пользователей у которых хотя бы один визит был N-м или выше.
         """
         assert self.counter_id
         host_filter = self._make_filter(None, filter_host, filter_hosts)
-        visit_filter = f"ym:s:visitNumber>={min_visits}"
+
+        # ym:s:visitNumberSite — порядковый номер визита пользователя на сайте
+        # Если у пользователя был визит с номером >= min_visits, 
+        # значит он посещал сайт min_visits раз
+        visit_filter = f"ym:s:visitNumberSite>={min_visits}"
 
         if host_filter:
             combined = f"({host_filter}) AND {visit_filter}"
@@ -577,9 +583,11 @@ class MetrikaClient:
         }
         try:
             data = self._get("/stat/v1/data", params)
-            return round(data.get("totals", [0])[0])
+            result = round(data.get("totals", [0])[0])
+            log.info("get_active_users %s-%s: %d (filter: %s)", d1, d2, result, combined[:80])
+            return result
         except Exception as e:
-            log.warning("get_active_users: %s", e)
+            log.warning("get_active_users error: %s | filter: %s", e, combined[:80])
             return 0
 
     def get_new_users(
@@ -607,7 +615,7 @@ class MetrikaClient:
             data = self._get("/stat/v1/data", params)
             return round(data.get("totals", [0])[0])
         except Exception as e:
-            log.warning("get_new_users: %s", e)
+            log.warning("get_new_users error: %s | filter: %s", e, flt)
             return 0
 
     def get_users_by_product_monthly(
@@ -656,7 +664,7 @@ class MetrikaClient:
                 log.warning("get_users_by_product_monthly %s: %s", label, e)
                 continue
 
-            # Группируем по первому сегменту пути
+            # Группируем по первому сегменту пути, пропускаем служебные
             from collections import defaultdict
             prefix_users: dict[str, int] = defaultdict(int)
             for row in data.get("data", []):
@@ -666,6 +674,8 @@ class MetrikaClient:
                     continue
                 _, parts = parsed
                 prefix = "/" + parts[0] if parts else "/"
+                if prefix in SKIP_PRODUCT_PATHS:
+                    continue
                 prefix_users[prefix] += round(row["metrics"][0])
 
             for prefix, users in prefix_users.items():
@@ -684,6 +694,13 @@ def _safe_parse(url_str: str) -> tuple[str, list[str]] | None:
         return host, parts
     except Exception:
         return None
+
+
+# Служебные пути которые не показываем в топе продуктов
+SKIP_PRODUCT_PATHS: set[str] = {
+    "/sfera-error", "/login", "/logout", "/signup", "/reset-password",
+    "/change-password", "/remember-password", "/sfera-error",
+}
 
 
 def _prettify_prefix(prefix: str, host: str) -> str:
