@@ -356,42 +356,48 @@ async def cmd_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     try:
         loop = asyncio.get_event_loop()
+        from metrika import UNI_REGISTRY, UNI_SLUG_MERGE, _is_gateway_slug
 
-        # Обнаруживаем ВУЗы
+        # Обнаруживаем ВУЗы из Метрики
         unis = await loop.run_in_executor(None, metrika.discover_unis)
-        if not unis:
-            await status_msg.edit_text("❌ ВУЗы не обнаружены в счётчике")
-            return
+
+        # Дополняем ВУЗами из реестра у которых нет данных в Метрике
+        found_slugs = {u["slug"] for u in unis}
+        for slug, name in UNI_REGISTRY.items():
+            canonical = UNI_SLUG_MERGE.get(slug, slug)
+            if canonical not in found_slugs and slug not in found_slugs:
+                # ВУЗ из реестра, но нет данных — добавляем с пустым хостом
+                unis.append({"slug": slug, "name": name, "hosts": [], "host": ""})
+                found_slugs.add(slug)
 
         await status_msg.edit_text(
-            f"📊 Найдено ВУЗов: *{len(unis)}*\n"
-            f"⏳ Собираю метрики по каждому...",
+            f"📊 ВУЗов в реестре: *{len(set(UNI_REGISTRY.values()))}*\n"
+            f"⏳ Собираю метрики...",
             parse_mode=ParseMode.MARKDOWN,
         )
 
-        # Собираем статистику по каждому ВУЗу
+        # Собираем статистику только по ВУЗам с хостами
         uni_stats = []
-        for i, uni in enumerate(unis):
+        unis_with_hosts = [u for u in unis if u.get("hosts") or u.get("host")]
+        for i, uni in enumerate(unis_with_hosts):
             await status_msg.edit_text(
-                f"📊 Обрабатываю {i+1}/{len(unis)}: *{uni['name']}*...",
+                f"📊 {i+1}/{len(unis_with_hosts)}: *{uni['name']}*...",
                 parse_mode=ParseMode.MARKDOWN,
             )
             s = await loop.run_in_executor(
-                None, lambda u=uni: collect_uni_stats(metrika, u, months=3)
+                None, lambda u=uni: collect_uni_stats(metrika, u)
             )
             uni_stats.append(s)
 
         await status_msg.edit_text("🖼 Строю графики и отправляю отчёт...")
 
-        # Сохраняем файлы
-        await loop.run_in_executor(None, lambda: save_report_files(uni_stats))
-
-        # Отправляем в Telegram
         tg_token = os.environ["TELEGRAM_TOKEN"]
-        chat_id = update.effective_chat.id
+        chat_id  = update.effective_chat.id
+
+        # Отправляем
         await loop.run_in_executor(
             None,
-            lambda: send_report_to_telegram(tg_token, chat_id, uni_stats, months=3)
+            lambda: send_report_to_telegram(tg_token, chat_id, uni_stats)
         )
 
         await status_msg.edit_text("✅ Отчёт сформирован и отправлен")
